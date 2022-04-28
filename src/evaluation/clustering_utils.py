@@ -42,7 +42,6 @@ def sample_2_frame(target, index, cluster, n_clusters):
     target_clusters = []
     index = parse_index(index, target.shape[-1])
     N, T = target.shape
-    print(cluster.shape, index.shape)
     for i in range(n_clusters):
         ind = cluster == i
         temp = torch.zeros_like(target).flatten()
