@@ -5,65 +5,53 @@ import torch
 import os
 
 import src
+from utils.torch_utilities import wav_2_spec
 from utils.utilities import mkdir, numpy_2_midi
 from models.models import DisentanglementModel
-from conf.feature import SAMPLE_RATE
-from evaluation.inference_utils import transcribe_and_separate, align, fit_pca
+from conf.feature import SAMPLE_RATE, NOTES_NUM
+from evaluation.inference_utils import extract_rep, refine, generate_output, gpu_device, scale
 
-def numpy_2_json(center, emb, output_path, spec_len):
-    center = center.tolist()
-    dt = np.dtype([('name', 'S10'), ('age', int)])
-    a = np.array([("raju", 21), ("anil", 25), ("ravi", 17), ("amar", 27)], dtype=dt)
-    ind = np.lexsort((emb[:, 1], -emb[:, 0]))
-    emb = emb[ind]
-    emb[:, 0] = 128 - emb[:, 0]
-    max_sec = spec_len
-    max_p = int(np.max(emb[:, 0])) + 4
-    min_p = int(np.min(emb[:, 0])) - 4
-    border_t = [float(np.min(emb[:, -2])), float(np.min(emb[:, -1])), float(np.max(emb[:, -2])), float(np.max(emb[:, -1]))]
-    ind = np.arange(emb.shape[0])[:, None] + 1
-    ind[-1, 0] = -1
-    color = (emb[:, 2] + 1).tolist()
-    emb = np.concatenate([emb[:, 1:2], emb[:, :1], ind, emb[:, 3:]], 1)
-    timbre = np.concatenate([emb[:, -2:], ind], 1).tolist()
-    data = emb[:, :3].tolist()
-    json_data = {"sourcesNum": len(center), "center": center, "color": color,
-                 "pianoRoll": {"data": data, "border": [0, min_p, max_sec, max_p]},
-                "timbre": {"data": timbre, "border": border_t}}
+def json_2_numpy(x, sources_num, spec_len):
+    pos = gpu_device(np.array(x["data"]))
+    c = gpu_device(np.array(x["color"])) - 1
+    cluster_targets = []
+    for i in range(sources_num):
+        zero_target = torch.zeros([spec_len, NOTES_NUM - 1]).to(pos.device).flatten()
+        ind = c == i + 1
+        ind = pos[ind]
+        nind = ind[:, 0] * (NOTES_NUM - 1) + (NOTES_NUM - 1 - ind[:, 1])
+        zero_target[nind.long()] = 1
+        cluster_targets.append(zero_target.view(spec_len, NOTES_NUM - 1))
+    return cluster_targets
 
-    with open(output_path, 'w') as f:
-        json.dump(json_data, f)
-
-def inference(model_path, audioData, sources_num, file_type):
+def inference(model_path, note_data, audio_data, sources_num, file_type="wav"):
     nnet = DisentanglementModel().cuda()
     nnet.load_state_dict(torch.load(model_path))
-    audioData = audioData.cuda().squeeze(0)
-    output_folder = "output"
+
+    output_folder = "output_step2"
     mkdir(output_folder)
-    with torch.no_grad():
-        est_wavs, note_preds, center, rep, exported_data = transcribe_and_separate(nnet, audioData, sources_num,
-                                                                              is_clustering=True)
-        emb = fit_pca(np.concatenate([center, exported_data[:, 3:]], 0))
-        emb = emb * 1000
-        center = emb[:center.shape[0]]
-        emb = np.concatenate([exported_data[:, :3], emb[center.shape[0]:]], -1)
-        spec_len = note_preds[0].shape[-1]
-        numpy_2_json(center, emb, os.path.join(output_folder, "data.json"), spec_len)
-        np.save(os.path.join(output_folder, "rep.npy"), rep)
-        numpy_2_midi([n.cpu().numpy() for n in note_preds], os.path.join(output_folder, "pred.mid"))
-        for i, wav in enumerate(est_wavs):
-            torchaudio.save(os.path.join(output_folder, f"{i}.{file_type}"), wav.float().cpu(), SAMPLE_RATE)
+
+    mix = audio_data.cuda().squeeze(0)
+    rep, abt_rep, spec_len, wav_len, cos, sin = extract_rep(nnet, mix, sources_num)
+    target = torch.zeros([NOTES_NUM - 1, rep.shape[-1]]).to(rep.device)
+    _, mean, std = scale(0., 1)(mix)
+    mix_scale_fn = scale(mean, std, sources_num)
+    est_wavs, note_preds, center, exported_data = \
+        refine(nnet, note_data, rep, abt_rep, cos, sin, wav_len, spec_len, mix_scale_fn, sources_num, target)
+    generate_output(output_folder, center, exported_data, note_preds, est_wavs)
     return output_folder
 
 if __name__ == "__main__":
-    data_path = "input_data/metadata"
-    with open(data_path, "r") as f:
-        metadata = json.load(f)
-    file_type = metadata["audioType"]
-    sources_num = metadata["sourcesNum"]
-    audio_path = "input_data/mix.wav" if str.endswith(file_type, "wav") else "input_data/mix.mp3"
+    data_path = "revised_data/"
+    json_path = os.path.join(data_path, "data.json")
+    audio_path = os.path.join(data_path, "mix.wav")
+    with open(json_path, "r") as f:
+        json_data = json.load(f)
+    note_data = json_data["data"]
+    sources_num = json_data["sourcesNum"]
     model_path = "model_weights"
-    audio_data, src = torchaudio.load(audio_path)
-    file_type = "wav" if str.endswith(file_type, "wav") else "mp3"
-    inference(model_path, audio_data, sources_num, file_type)
+    audio_data, sr = torchaudio.load(audio_path)
+    if not sr == SAMPLE_RATE:
+        audio_data = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(audio_data)
+    inference(model_path,  note_data, audio_data, sources_num)
 

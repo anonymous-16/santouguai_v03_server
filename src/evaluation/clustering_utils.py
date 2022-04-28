@@ -1,5 +1,5 @@
 import random
-
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,15 +33,14 @@ def frame_2_sample(target, rep):
     return z, torch.stack([x, y], 1)
 
 
-def parse_index(ind, target):
-    _, T = target.shape
-    ind = ((ind[:, 0] * T) + ind[:, 1]).long()
+def parse_index(ind, t):
+    ind = ((ind[:, 0] * t) + ind[:, 1]).long()
     return ind
 
 
 def sample_2_frame(target, index, cluster, n_clusters):
     target_clusters = []
-    index = parse_index(index, target)
+    index = parse_index(index, target.shape[-1])
     N, T = target.shape
     print(cluster.shape, index.shape)
     for i in range(n_clusters):
@@ -98,7 +97,7 @@ def estimate_target(note_prob, onset_prob):
                     res[i, j - seg_len] = 1
                 seg_len = 0
     onset_target = res
-    return note_target
+    return note_target, onset_target
 
 
 def smooth(sample_rep, sample_index):
@@ -145,15 +144,11 @@ def smooth(sample_rep, sample_index):
             sample_rep[ind] = sample_rep[ind].mean(0)
         elif len(index[ind]) == 1:
             index[ind] = -1
-    return sample_rep, sample_index
-
-
-def load_note(path):
-    notes = read_lst(path, "\t\t")
+    return sample_rep
 
 
 class EmbeddingCenter(nn.Module):
-    def __init__(self, sample_reps, batch_size=16, loss_weights=None):
+    def __init__(self, sample_reps, loss_weights=None, batch_size=512):
         super().__init__()
         n_clusters = len(sample_reps)
         param_list = []
@@ -164,13 +159,14 @@ class EmbeddingCenter(nn.Module):
         for i in range(n_clusters):
             labels.append(torch.zeros_like(sample_reps[i][:, 0]) + i)
 
-        self.data = torch.cat(sample_reps, 0)
-        self.label = torch.cat(labels, 0).long()
-        if loss_weights is None:
-            self.loss_weight = torch.ones_like(self.label)
+        data = torch.cat(sample_reps, 0)
+        label = torch.cat(labels, 0).long()
+        ind = loss_weights > 0
+        self.data = data[ind]
+        self.label = label[ind]
         self.batch_size = batch_size
         self.sample_reps = sample_reps
-        self.index = torch.arange(self.data.shape[0]).to(self.data.device)
+        self.index = np.arange(self.data.shape[0])
 
     def compute_center(self):
         centers = []
@@ -179,70 +175,92 @@ class EmbeddingCenter(nn.Module):
         return torch.stack(centers, -1)
 
     def forward(self):
-        random.shuffle(self.index)
         samples_num = self.data.shape[0]
+        random.shuffle(self.index)
         for i in range(0, samples_num, self.batch_size):
             center = self.compute_center()
             st = i
-            ed = i + self.batch_size if i + self.batch_size < samples_num else samples_num
-            ind = self.index[st: ed]
+            ed = st + self.batch_size if st + self.batch_size < samples_num else samples_num
+            ind = torch.from_numpy(self.index[st: ed]).to(self.data.device).long()
             dis = - ((self.data[ind][:, :, None] - center[None, :]) ** 2).sum(1)
-            loss = nn.CrossEntropyLoss(reduction='none')(dis, self.label[ind])
-            loss = (loss * self.loss_weight[ind]).sum()
+            loss = nn.CrossEntropyLoss(reduction='mean')(dis, self.label[ind])
             yield loss
+            if ed + self.batch_size > samples_num:
+                break
 
 
 def clustering_from_preds(target, rep, n_clusters):
     sample_rep, sample_index = frame_2_sample(target, rep)
-    sample_rep, sample_index = smooth(sample_rep, sample_index)
+    sample_rep = smooth(sample_rep, sample_index)
     cluster, center = kmeans(sample_rep, n_clusters)
     target_clusters = sample_2_frame(target, sample_index, cluster, n_clusters)
-    sample_rep, sample_index, cluster, center = fit_center(target_clusters, rep)
-    target_clusters = sample_2_frame(target, sample_index, cluster, n_clusters)
-    return target_clusters, torch.cat([sample_index, cluster[:, None] + 1, sample_rep], -1), center
+    return target_clusters, get_exported_data(sample_index, cluster, sample_rep), center
 
+def get_exported_data(sample_index, cluster, sample_rep, key_points=None):
+    key_points = torch.zeros_like(cluster) if key_points is None else key_points
+    return torch.cat([sample_index, cluster[:, None] + 1, key_points[:, None], sample_rep], -1)
 
-def fit_center(targets, rep):
-    sample_reps, sample_indexs, sample_labels = [], [], []
-    for i, target in enumerate(targets):
-        sample_rep, sample_index = frame_2_sample(target, rep)
-        sample_reps.append(sample_rep)
-        sample_indexs.append(sample_index)
-        sample_labels.append(torch.zeros_like(sample_rep[:, 0]) + i)
-    model = EmbeddingCenter(sample_reps)
+def fit_center(sample_index, rep, cluster, key_point, n_clusters, target):
+    index = parse_index(sample_index, rep.shape[-1])
+    rep = rep.view(target.shape[0], -1, target.shape[1]).transpose(1, 2).flatten(0, 1)
+    sample_rep = rep[index]
+    sample_reps, sample_indexs, sample_labels, sample_key_points, loss_weights = [], [], [], [], []
+    for i in range(n_clusters):
+        ind = cluster == i
+        srep = smooth(sample_rep[ind], sample_index[ind])
+        sample_reps.append(srep)
+        sample_indexs.append(sample_index[ind])
+        sample_labels.append(cluster[ind])
+        sample_key_points.append(key_point[ind])
+        mask = key_point[ind]
+        loss_weights.append(mask)
 
     sample_rep = torch.cat(sample_reps, 0)
     sample_index = torch.cat(sample_indexs, 0)
     sample_label = torch.cat(sample_labels, 0)
-
+    sample_key_point = torch.cat(sample_key_points, 0)
+    loss_weight = torch.cat(loss_weights, 0)
+    model = EmbeddingCenter(sample_reps, loss_weight)
     model.cuda()
     loss_total = 23333
-    loss_tol = 0.001
-    lr = 1e-3
-    MAX_STEP = 100
+    lr = 0.1
+    MAX_STEP = 300
     opt = torch.optim.Adam(model.param_list, lr=lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0., amsgrad=True)
 
     step = 0.
-    while loss_total > loss_tol:
+    acc = 0.
+    acc_tol = 0.999
+    if loss_weight.sum() == 0:
+        acc = 1
+        label = sample_label
+    while acc < acc_tol:
         loss_total = 0.
         step += 1
+        batches_num = 0
         for loss in model():
+            batches_num += 1
             loss_total += loss.item()
-            loss = loss / model.batch_size
             opt.zero_grad()
             loss.backward()
             opt.step()
-            loss_total += loss
-        loss_total = loss_total / sample_rep.shape[0]
-        print(f"step {step}", loss_total.item())
+        loss_total = loss_total
+        center = model.compute_center()
+        label = torch.argmin(((sample_rep[:, :, None] - center[None, :]) ** 2).sum(1), -1)
+        acc = len(label[loss_weight > 0][sample_label[loss_weight > 0] == label[loss_weight > 0]]) * 1. / \
+              label[loss_weight > 0].shape[0]
+        print(f"step {step}", loss_total, acc)
         if step > MAX_STEP:
             break
+
     model.eval()
     with torch.no_grad():
         center = model.compute_center()
         label = torch.argmin(((sample_rep[:, :, None] - center[None, :]) ** 2).sum(1), -1)
         print("acc", len(label[sample_label == label]), "/", label.shape[0])
-    return sample_rep, sample_index, label, center.transpose(-1, -2)
+        print("acc", len(label[loss_weight > 0][sample_label[loss_weight > 0] == label[loss_weight > 0]]), "/", label[loss_weight > 0].shape[0])
+    cluster_targets = sample_2_frame(target, sample_index, label, n_clusters)
+    exportd_data = get_exported_data(sample_index, label, sample_rep, sample_key_point)
+    return cluster_targets, exportd_data, center.transpose(-1, -2)
 
 
 class ClusteringUtil(object):
@@ -259,7 +277,7 @@ class ClusteringUtil(object):
         sample_reps = []
         for i in range(sources_num):
             sample_rep, sample_index = frame_2_sample(target[i], self.rep)
-            index = parse_index(sample_index, target[i])
+            index = parse_index(sample_index, target[i].shape[-1])
             sample_mask = mask[index]
             sample_rep = sample_rep[sample_mask > 0]
             sample_reps.append(sample_rep)
