@@ -1,8 +1,11 @@
 __pycache__/
 .idea/
+revised_data/
+revised_data.zip
 input_data/
 output_step1/
 output_step2/
+output_step11111/
 output_step1.zip
 output_step2.zip
 model_weights
