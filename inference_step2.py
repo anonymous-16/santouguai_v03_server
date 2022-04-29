@@ -9,11 +9,11 @@ from utils.torch_utilities import wav_2_spec
 from utils.utilities import mkdir, numpy_2_midi
 from models.models import DisentanglementModel
 from conf.feature import SAMPLE_RATE, NOTES_NUM
-from evaluation.inference_utils import extract_rep, refine, generate_output, gpu_device, scale
+from evaluation.inference_utils import extract_rep, refine, generate_output, torch_device, scale
 
 def json_2_numpy(x, sources_num, spec_len):
-    pos = gpu_device(np.array(x["data"]))
-    c = gpu_device(np.array(x["color"])) - 1
+    pos = torch_device(np.array(x["data"]))
+    c = torch_device(np.array(x["color"])) - 1
     cluster_targets = []
     for i in range(sources_num):
         zero_target = torch.zeros([spec_len, NOTES_NUM - 1]).to(pos.device).flatten()
@@ -31,7 +31,7 @@ def inference(model_path, note_data, audio_data, sources_num, file_type="wav"):
     output_folder = "output_step2"
     mkdir(output_folder)
 
-    mix = audio_data.cuda().squeeze(0)
+    mix = audio_data.squeeze(0)
     rep, abt_rep, spec_len, wav_len, cos, sin = extract_rep(nnet, mix, sources_num)
     target = torch.zeros([NOTES_NUM - 1, rep.shape[-1]]).to(rep.device)
     _, mean, std = scale(0., 1)(mix)

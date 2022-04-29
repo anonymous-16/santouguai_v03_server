@@ -10,7 +10,7 @@ import numpy as np
 
 from utils.utilities import mkdir, numpy_2_midi
 from utils.torch_utilities import (predict, onehot_tensor, spec_2_wav, wav_2_spec)
-from .clustering_utils import clustering_from_preds, fit_center, sample_2_frame, get_exported_data, estimate_target
+from .clustering_utils import clustering_from_preds, fit_center, frame_2_sample, get_exported_data, estimate_target
 from conf.feature import *
 from conf.inference import *
 
@@ -61,8 +61,8 @@ def generate_output(output_folder, center, exported_data, note_preds, est_wavs):
 	for i, wav in enumerate(est_wavs):
 		torchaudio.save(os.path.join(output_folder, f"{i}.wav"), wav.float().cpu(), SAMPLE_RATE)
 
-def gpu_device(x):
-	return torch.from_numpy(x).float().cuda()
+def torch_device(x):
+	return torch.from_numpy(x).float()
 
 def cpu_device(x):
 	return x.cpu().numpy()
@@ -78,9 +78,9 @@ def inference_rep(nnet, mix_spec, spec_len):
 		st = i * seg_frame
 		ed = (i + 1) * seg_frame
 		spec_in = mix_spec[None, :, st:ed]
-		output = nnet(spec_in, "inference_rep")
+		output = nnet(spec_in.cuda(), "inference_rep")
 		outputs.append(output)
-	params = [torch.cat([o[i].squeeze(0) for o in outputs], -1) for i in range(4)]
+	params = [torch.cat([o[i].squeeze(0).cpu() for o in outputs], -1) for i in range(4)]
 	for i in range(2, 4):
 		params[i][:, spec_len:] = 0
 	rep, abt_rep, note_prob, onset_prob = params
@@ -119,7 +119,7 @@ def transcribe_and_separate(nnet, mix, sources_num):
 	targets_cluster, exported_data, center = clustering_from_preds(note_target, abt_rep, sources_num)
 	with torch.no_grad():
 		est_wavs, note_pred = inference_wav(nnet, targets_cluster, rep, cos, sin, wav_len, spec_len, mix_scale_fn)
-	return est_wavs, note_pred, cpu_device(center), cpu_device(torch.cat([abt_rep.flatten(0, 1), rep], 0)), cpu_device(exported_data)
+	return est_wavs, note_pred, center.numpy(), torch.cat([abt_rep.flatten(0, 1), rep], 0).numpy(), exported_data.numpy()
 
 def extract_rep(nnet, mix, sources_num):
 	mix_spec, cos, sin, mix_scale_fn, spec_len, wav_len, pad_len = preprocess_data(mix, scale(0., 1), sources_num)
@@ -139,8 +139,8 @@ def inference_wav(nnet, targets_cluster, rep, cos, sin, wav_len, spec_len, mix_s
 			st = j * seg_frame
 			ed = (j + 1) * seg_frame
 			rec_target = targets_cluster[i][None, :, st : ed]
-			sep, est_note = nnet((rep[None, :, st:ed], rec_target), "inference_spec")
-			outputs.append([sep, est_note])
+			sep, est_note = nnet((rep[None, :, st:ed].cuda(), rec_target.cuda()), "inference_spec")
+			outputs.append([sep.cpu(), est_note.cpu()])
 
 		cat_outputs = []
 		for j in range(2):
@@ -161,16 +161,37 @@ def refine(nnet, note_data, rep, abt_rep, cos, sin, wav_len, spec_len, mix_scale
 	sample_index = np.concatenate([NOTES_NUM - 1 - index[:, 1:2], index[:, :1]], 1)
 	key_points = index[:, 3]
 	ind = cluster > 0
-	sample_index = gpu_device(sample_index[ind])
-	cluster = gpu_device(cluster[ind]) - 1
-	key_points = gpu_device(key_points[ind])
+	sample_index = torch_device(sample_index[ind])
+	cluster = torch_device(cluster[ind]) - 1
+	key_points = torch_device(key_points[ind])
 	cluster_targets, exportd_data, center = fit_center(sample_index, abt_rep, cluster, key_points, sources_num, target)
 
 	nnet.eval()
 	with torch.no_grad():
 		est_wavs, _ = inference_wav(nnet, cluster_targets, rep, cos, sin, wav_len, spec_len, mix_scale_fn)
 
-	return est_wavs, cluster_targets, cpu_device(center), cpu_device(exportd_data)
+	return est_wavs, cluster_targets, center.numpy(), exportd_data.numpy()
+
+def extract_center(nnet, mix, note_data, sources_num):
+	rep, abt_rep, spec_len, wav_len, cos, sin = extract_rep(nnet, mix, sources_num)
+	if note_data[0].shape[-1] < abt_rep.shape[-1]:
+		pad_len = abt_rep.shape[-1] - note_data[0].shape[-1]
+		note_data = [F.pad(n, (0, pad_len), "constant", 0) for n in note_data]
+	else:
+		note_data = [n[:, :abt_rep.shape[-1]] for n in note_data]
+	sample_indexs = []
+	key_points = []
+	clusters = []
+	for i, target in enumerate(note_data):
+		_, sample_index = frame_2_sample(target, abt_rep)
+		sample_indexs.append(sample_index)
+		key_points.append(torch.ones_like(sample_index[:, 0]))
+		clusters.append(torch.zeros_like(key_points[-1]) + i)
+	sample_index = torch.cat(sample_indexs, 0)
+	key_point = torch.cat(key_points, 0)
+	cluster = torch.cat(clusters, 0)
+	_, _, center = fit_center(sample_index, abt_rep, cluster, key_point, sources_num, note_data[0], is_smooth=False)
+	return center
 
 
 

@@ -15,7 +15,7 @@ from evaluation.inference_utils import transcribe_and_separate, generate_output
 def inference(model_path, audioData, sources_num, file_type):
     nnet = DisentanglementModel().cuda()
     nnet.load_state_dict(torch.load(model_path))
-    audioData = audioData.cuda().squeeze(0)
+    audioData = audioData.squeeze(0)
     output_folder = "output_step1"
     mkdir(output_folder)
     est_wavs, note_preds, center, rep, exported_data = transcribe_and_separate(nnet, audioData, sources_num)

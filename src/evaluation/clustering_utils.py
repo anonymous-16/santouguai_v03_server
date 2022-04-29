@@ -9,8 +9,8 @@ from src.utils.utilities import read_lst
 from src.utils.torch_utilities import predict
 
 
-def device(x):
-    return torch.from_numpy(x).cuda()
+def torch_device(x):
+    return torch.from_numpy(x)
 
 
 def kmeans(rep, n_clusters):
@@ -18,7 +18,7 @@ def kmeans(rep, n_clusters):
     n_clustering = KMeans(n_clusters=n_clusters, random_state=0).fit(y)
     center = n_clustering.cluster_centers_
     label = n_clustering.labels_
-    return device(label), device(center)
+    return torch_device(label), torch_device(center)
 
 
 def frame_2_sample(target, rep):
@@ -147,7 +147,7 @@ def smooth(sample_rep, sample_index):
 
 
 class EmbeddingCenter(nn.Module):
-    def __init__(self, sample_reps, loss_weights=None, batch_size=512):
+    def __init__(self, sample_reps, loss_weights=None, batch_size=2048):
         super().__init__()
         n_clusters = len(sample_reps)
         param_list = []
@@ -176,13 +176,16 @@ class EmbeddingCenter(nn.Module):
     def forward(self):
         samples_num = self.data.shape[0]
         random.shuffle(self.index)
+        et = 1e-7
         for i in range(0, samples_num, self.batch_size):
             center = self.compute_center()
             st = i
             ed = st + self.batch_size if st + self.batch_size < samples_num else samples_num
-            ind = torch.from_numpy(self.index[st: ed]).to(self.data.device).long()
+            ind = torch_device(self.index[st: ed]).to(self.data.device).long()
             dis = - ((self.data[ind][:, :, None] - center[None, :]) ** 2).sum(1)
-            loss = nn.CrossEntropyLoss(reduction='mean')(dis, self.label[ind])
+            loss = nn.CrossEntropyLoss()(dis, self.label[ind])
+            loss_w = loss.detach()
+            loss = (loss_w / (loss_w.sum() + et) * loss).mean()
             yield loss
             if ed + self.batch_size > samples_num:
                 break
@@ -199,14 +202,14 @@ def get_exported_data(sample_index, cluster, sample_rep, key_points=None):
     key_points = torch.zeros_like(cluster) if key_points is None else key_points
     return torch.cat([sample_index, cluster[:, None] + 1, key_points[:, None], sample_rep], -1)
 
-def fit_center(sample_index, rep, cluster, key_point, n_clusters, target):
+def fit_center(sample_index, rep, cluster, key_point, n_clusters, target, is_smooth=True):
     index = parse_index(sample_index, rep.shape[-1])
     rep = rep.view(target.shape[0], -1, target.shape[1]).transpose(1, 2).flatten(0, 1)
     sample_rep = rep[index]
     sample_reps, sample_indexs, sample_labels, sample_key_points, loss_weights = [], [], [], [], []
     for i in range(n_clusters):
         ind = cluster == i
-        srep = smooth(sample_rep[ind], sample_index[ind])
+        srep = smooth(sample_rep[ind], sample_index[ind]) if is_smooth else sample_rep[ind]
         sample_reps.append(srep)
         sample_indexs.append(sample_index[ind])
         sample_labels.append(cluster[ind])
@@ -219,16 +222,17 @@ def fit_center(sample_index, rep, cluster, key_point, n_clusters, target):
     sample_label = torch.cat(sample_labels, 0)
     sample_key_point = torch.cat(sample_key_points, 0)
     loss_weight = torch.cat(loss_weights, 0)
-    model = EmbeddingCenter(sample_reps, loss_weight)
-    model.cuda()
+    batch_size = 2048
+    model_rep = [r.cuda() for r in sample_reps]
+    model = EmbeddingCenter(model_rep, loss_weight, batch_size).cuda()
     loss_total = 23333
     lr = 0.1
-    MAX_STEP = 300
+    MAX_STEP = 200
     opt = torch.optim.Adam(model.param_list, lr=lr, betas=(0.9, 0.999), eps=1e-08, weight_decay=0., amsgrad=True)
 
     step = 0.
     acc = 0.
-    acc_tol = 0.999
+    acc_tol = 1
     if loss_weight.sum() == 0:
         acc = 1
         label = sample_label
@@ -243,17 +247,20 @@ def fit_center(sample_index, rep, cluster, key_point, n_clusters, target):
             loss.backward()
             opt.step()
         loss_total = loss_total
-        center = model.compute_center()
+        center = model.compute_center().cpu()
         label = torch.argmin(((sample_rep[:, :, None] - center[None, :]) ** 2).sum(1), -1)
-        acc = len(label[loss_weight > 0][sample_label[loss_weight > 0] == label[loss_weight > 0]]) * 1. / \
-              label[loss_weight > 0].shape[0]
-        print(f"step {step}", loss_total, acc)
+        acc_gt = sample_label[loss_weight > 0]
+        acc_pred = label[loss_weight > 0]
+        acc = len(acc_pred[acc_pred == acc_gt]) * 1. / acc_gt.shape[0]
+        if step % 20 == 0:
+            print(f"step {int(step)} lr: {lr} ----", loss_total, acc)
+            lr *= 0.5
         if step > MAX_STEP:
             break
-
+    print(f"step {step}", loss_total, acc)
     model.eval()
     with torch.no_grad():
-        center = model.compute_center()
+        center = model.compute_center().cpu()
         label = torch.argmin(((sample_rep[:, :, None] - center[None, :]) ** 2).sum(1), -1)
         print("acc", len(label[sample_label == label]), "/", label.shape[0])
         print("acc", len(label[loss_weight > 0][sample_label[loss_weight > 0] == label[loss_weight > 0]]), "/", label[loss_weight > 0].shape[0])
