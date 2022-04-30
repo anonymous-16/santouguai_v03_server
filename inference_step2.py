@@ -51,6 +51,8 @@ if __name__ == "__main__":
     sources_num = json_data["sourcesNum"]
     model_path = "model_weights"
     audio_data, sr = torchaudio.load(audio_path)
+    if len(audio_data.shape) > 1:
+        audio_data = audio_data[0]
     if not sr == SAMPLE_RATE:
         audio_data = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(audio_data)
     inference(model_path,  note_data, audio_data, sources_num)

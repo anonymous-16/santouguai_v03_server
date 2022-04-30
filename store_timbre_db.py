@@ -60,6 +60,8 @@ def process(song_folder, mix_path, notes):
     output_folder = "timbre_db"
     mkdir(output_folder)
     audio_data, sr = torchaudio.load(mix_path)
+    if len(audio_data.shape) > 1:
+        audio_data = audio_data[0]
     spec_len = int((audio_data.shape[-1] / sr + 1) * FRAMES_PER_SEC)
     tags = [tag for tag in notes]
     notes = [notes[tag] for tag in tags]

@@ -30,6 +30,8 @@ if __name__ == "__main__":
     audio_path = "input_data/mix.wav" if str.endswith(file_type, "wav") else "input_data/mix.mp3"
     model_path = "model_weights"
     audio_data, sr = torchaudio.load(audio_path)
+    if len(audio_data.shape) > 1:
+        audio_data = audio_data[0]
     if not sr == SAMPLE_RATE:
         audio_data = torchaudio.transforms.Resample(sr, SAMPLE_RATE)(audio_data)
     file_type = "wav" if str.endswith(file_type, "wav") else "mp3"
